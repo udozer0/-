@@ -1,3 +1,4 @@
+#pragma once
 #include "messages.hpp"
 #include "queue.hpp"
 #include "settings.hpp"
@@ -6,7 +7,7 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
-#include <iostream>          // ← обязательно!
+#include <iostream>
 #include <random>
 #include <sstream>
 #include <string>
@@ -16,7 +17,7 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr const char* protocol_dir = "protocols";   // ← добавляем здесь
+constexpr const char* protocol_dir = "protocols";
 
 class MainLoop {
 public:
@@ -30,30 +31,22 @@ public:
         parent_pid_ = getpid();
         run_ = true;
 
-        // Создаём 5 процессов-станций
         for (const auto& station : settings_.stations_params) {
             pid_t pid = fork();
             if (pid == 0) {
                 setpgid(0, parent_pid_);
-                Consume(station);               // дочерний процесс не возвращается
-                _exit(0);                       // на всякий случай
+                Consume(station);
+                _exit(0);
             }
-            if (pid > 0) {
-                processes_.push_back(pid);
-            } else {
-                std::cerr << "fork failed\n";
-            }
+            if (pid > 0) processes_.push_back(pid);
         }
 
-        // Генератор в родительском процессе
         thread_ = std::thread{&MainLoop::Produce, this, settings_.create};
     }
 
     ~MainLoop() {
         run_ = false;
-        for (auto pid : processes_) {
-            waitpid(pid, nullptr, 0);
-        }
+        for (auto pid : processes_) waitpid(pid, nullptr, 0);
         if (thread_.joinable()) thread_.join();
     }
 
@@ -67,11 +60,9 @@ private:
         while (run_) {
             GasType type = static_cast<GasType>(type_dist(gen));
             auto sleep_ms = GetRandomTime(par);
-
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 
             Message mes{id++, type, EXPECTED};
-
             if (!queue_.Push(mes)) {
                 mes.status = REJECTED;
                 rejected << mes << '\n';
@@ -102,14 +93,12 @@ private:
             protocol << mes << '\n';
             queue_protocol_ << "Обслужено: " << mes << '\n';
         }
-        _exit(0);
     }
 
     long GetRandomTime(Params p) {
         static thread_local std::mt19937 gen{std::random_device{}()};
         std::normal_distribution<double> dist(p.mean, p.stddev);
-        double val = dist(gen);
-        return std::max(1L, static_cast<long>(val + 0.5));  // округление + защита от ≤0
+        return std::max(1L, static_cast<long>(dist(gen)));
     }
 
 private:

@@ -8,18 +8,9 @@
 #include <stdexcept>
 #include <filesystem>
 
-constexpr char KEY_FILE[] = "protocols/queue";   // для ftok
-constexpr int NUM_SEMS = 5;
-
-#define SEM_MUTEX 0
-#define SEM_EMPTY 1
-#define SEM_76    2
-#define SEM_92    3
-#define SEM_95    4
-
 struct SharedQueue {
     int size;
-    Message messages[1];   // flexible array (выделяем с запасом)
+    Message messages[1];   // flexible array
 };
 
 class SharedMemory {
@@ -27,12 +18,13 @@ public:
     SharedMemory(int capacity);
     ~SharedMemory();
 
-    int semid() const { return semid_; }
-    int shmid() const { return shmid_; }
-    SharedQueue* attach() { return static_cast<SharedQueue*>(shmat(shmid_, nullptr, 0)); }
+    SharedQueue* attach() { return queue_ptr_; }
+    int getSemid() const { return semid_; }
 
 private:
     key_t key_ = -1;
     int shmid_ = -1;
     int semid_ = -1;
+    SharedQueue* queue_ptr_ = nullptr;
+    int capacity_;
 };

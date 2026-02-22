@@ -7,15 +7,15 @@ class Queue {
 public:
     explicit Queue(int capacity);
 
-    bool Push(Message msg);                          // Producer
-    std::optional<Message> Pop(GasType type);        // Consumer
+    bool Push(Message msg);
+    std::optional<Message> Pop(GasType type);
 
 private:
-    void P(int sem_num) { semop(semid_, &sops[sem_num], 1); }
-    void V(int sem_num) { sops[sem_num].sem_op = 1; P(sem_num); }
+    void P(int sem_num);
+    void V(int sem_num);
 
     SharedMemory shm_;
     int semid_;
     int capacity_;
-    struct sembuf sops[NUM_SEMS]{};
+    struct sembuf sops[5]{};
 };
