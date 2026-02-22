@@ -21,7 +21,10 @@ constexpr const char* protocol_dir = "protocols";
 
 class MainLoop {
 public:
-    MainLoop(Settings settings) : settings_(settings), queue_(settings.number_message_queue) {
+    MainLoop(Settings settings) 
+        : settings_(settings)
+        , queue_(settings.number_message_queue)   // теперь порядок правильный
+    {
         if (std::filesystem::exists(protocol_dir))
             std::filesystem::remove_all(protocol_dir);
         std::filesystem::create_directory(protocol_dir);
@@ -102,7 +105,7 @@ private:
     }
 
 private:
-    Queue queue_;
+    Queue queue_;           // ← теперь перед settings_
     std::atomic<bool> run_{true};
     pid_t parent_pid_;
     std::thread thread_;

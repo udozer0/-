@@ -1,10 +1,12 @@
 #include "shared_memory.hpp"
+#include <fstream>          // ← обязательно для ofstream
 
 SharedMemory::SharedMemory(int capacity) : capacity_(capacity) {
     std::filesystem::create_directory("protocols");
 
     const char* key_file = "protocols/queue.key";
-    std::ofstream{key_file};                     // создаём файл для ftok
+    std::ofstream{key_file, std::ios::out}.close();  // создаём файл для ftok
+
     key_ = ftok(key_file, 'Q');
     if (key_ == -1) throw std::runtime_error("ftok failed");
 
@@ -14,6 +16,7 @@ SharedMemory::SharedMemory(int capacity) : capacity_(capacity) {
 
     void* ptr = shmat(shmid_, nullptr, 0);
     if (ptr == (void*)-1) throw std::runtime_error("shmat failed");
+
     queue_ptr_ = static_cast<SharedQueue*>(ptr);
     queue_ptr_->size = 0;
 

@@ -8,6 +8,13 @@
 #include <stdexcept>
 #include <filesystem>
 
+// Явно определяем union semun (нужен для semctl)
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
+
 struct SharedQueue {
     int size;
     Message messages[1];   // flexible array
