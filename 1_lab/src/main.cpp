@@ -13,6 +13,7 @@ void signalHandler(int signum)
 
 int main(int argc, char **argv)
 {
+    // CTRL + C
     std::signal(SIGINT, signalHandler);
 
     Settings settings;
