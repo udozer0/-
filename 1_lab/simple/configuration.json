@@ -1,0 +1,34 @@
+{
+    "generator": {
+        "requests": 50,
+        "mean_generation_time": 1,
+        "standard_deviation": 0.5
+    },
+    "columns": [
+        {
+            "fuel": "АИ76",
+            "mean_service_time": 15,
+            "standard_deviation": 0.5
+        },
+        {
+            "fuel": "АИ76",
+            "mean_service_time": 10,
+            "standard_deviation": 0.5
+        },
+        {
+            "fuel": "АИ92",
+            "mean_service_time": 12.5,
+            "standard_deviation": 0.6
+        },
+        {
+            "fuel": "АИ92",
+            "mean_service_time": 12.5,
+            "standard_deviation": 0.6
+        },
+        {
+            "fuel": "АИ95",
+            "mean_service_time": 15,
+            "standard_deviation": 0.7
+        }
+    ]
+}
