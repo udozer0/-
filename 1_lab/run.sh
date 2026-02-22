@@ -7,4 +7,4 @@ cmake -S . -B build \
 -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build
-./build/loop conf.json
+./build/loop config.conf

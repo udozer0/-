@@ -1,3 +1,2 @@
-./build/*
-
-./protocols/*
+build/*
+protocols/*
