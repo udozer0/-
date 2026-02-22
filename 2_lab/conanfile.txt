@@ -1,0 +1,8 @@
+[requires]
+openmpi/4.1.6
+nlohmann_json/3.11.3
+ftxui/5.0.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
