@@ -1,61 +1,21 @@
+#pragma once
 #include "messages.hpp"
 #include "shared_memory.hpp"
-#include <filesystem>
-#include <fstream>
-#include <ios>
 #include <optional>
 
-constexpr auto protocol_dir = "protocols";
-
-class Queue
-{
+class Queue {
 public:
-    Queue(int capacity) : shared_(capacity), capacity_(capacity) {}
+    explicit Queue(int capacity);
 
-    Message Push(Message &elem)
-    {
-        auto session = shared_.OpenSession();
-
-        if (*session.GetMessages()->current_size >= capacity_)
-        {
-            elem.status = REJECTED;
-            return elem;
-        }
-
-        session.GetMessages()->messages[(*session.GetMessages()->current_size)++] = elem;
-
-        return elem;
-    }
-
-    std::optional<Message> Pop(const GasType type)
-    {
-        auto session = shared_.OpenSession();
-        auto messages = session.GetMessages();
-        for (auto i = 0; i < *messages->current_size; ++i)
-        {
-            if (messages->messages[i].gas_type == type && messages->messages[i].status == EXPECTED)
-            {
-                messages->messages[i].status = INWORK;
-                const auto mes = messages->messages[i];
-                Remove(messages->messages, i, messages->current_size);
-                return mes;
-            }
-        }
-
-        return {};
-    }
+    bool Push(Message msg);                          // Producer
+    std::optional<Message> Pop(GasType type);        // Consumer
 
 private:
-    void Remove(Message *mes, int index, int *size)
-    {
-        for (auto i = index; i < *size; ++i)
-        {
-            mes[i] = mes[i + 1];
-        }
-        (*size)--;
-    }
+    void P(int sem_num) { semop(semid_, &sops[sem_num], 1); }
+    void V(int sem_num) { sops[sem_num].sem_op = 1; P(sem_num); }
 
-private:
+    SharedMemory shm_;
+    int semid_;
     int capacity_;
-    SharedMemory shared_;
+    struct sembuf sops[NUM_SEMS]{};
 };
