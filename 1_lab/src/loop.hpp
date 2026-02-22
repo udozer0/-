@@ -6,6 +6,7 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <iostream>          // ← обязательно!
 #include <random>
 #include <sstream>
 #include <string>
@@ -15,10 +16,13 @@
 #include <unistd.h>
 #include <vector>
 
+constexpr const char* protocol_dir = "protocols";   // ← добавляем здесь
+
 class MainLoop {
 public:
     MainLoop(Settings settings) : settings_(settings), queue_(settings.number_message_queue) {
-        if (std::filesystem::exists(protocol_dir)) std::filesystem::remove_all(protocol_dir);
+        if (std::filesystem::exists(protocol_dir))
+            std::filesystem::remove_all(protocol_dir);
         std::filesystem::create_directory(protocol_dir);
 
         queue_protocol_.open(std::filesystem::path(protocol_dir) / "queue.log");
@@ -32,9 +36,13 @@ public:
             if (pid == 0) {
                 setpgid(0, parent_pid_);
                 Consume(station);               // дочерний процесс не возвращается
-                return;
+                _exit(0);                       // на всякий случай
             }
-            processes_.push_back(pid);
+            if (pid > 0) {
+                processes_.push_back(pid);
+            } else {
+                std::cerr << "fork failed\n";
+            }
         }
 
         // Генератор в родительском процессе
@@ -43,7 +51,9 @@ public:
 
     ~MainLoop() {
         run_ = false;
-        for (auto pid : processes_) waitpid(pid, nullptr, 0);
+        for (auto pid : processes_) {
+            waitpid(pid, nullptr, 0);
+        }
         if (thread_.joinable()) thread_.join();
     }
 
@@ -64,11 +74,11 @@ private:
 
             if (!queue_.Push(mes)) {
                 mes.status = REJECTED;
-                rejected << mes << std::endl;
+                rejected << mes << '\n';
             }
 
-            queue_protocol_ << "Новая заявка: " << mes << std::endl;
-            std::cout << "Новая заявка: " << mes << std::endl;
+            std::cout << "Новая заявка: " << mes << '\n';
+            queue_protocol_ << "Новая заявка: " << mes << '\n';
         }
     }
 
@@ -79,26 +89,27 @@ private:
 
         while (run_) {
             auto opt = queue_.Pop(station.type);
-            if (!opt) continue;
+            if (!opt.has_value()) continue;
 
             Message mes = opt.value();
-            std::cout << "Станция " << station.id << " обслуживает " << mes << std::endl;
-            queue_protocol_ << "Станция " << station.id << " --> " << mes << std::endl;
+            std::cout << "Станция " << station.id << " обслуживает " << mes << '\n';
+            queue_protocol_ << "Станция " << station.id << " --> " << mes << '\n';
 
             auto sleep_ms = GetRandomTime(station.handle);
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 
             mes.status = PROCESSED;
-            protocol << mes << std::endl;
-            queue_protocol_ << "Обслужено: " << mes << std::endl;
+            protocol << mes << '\n';
+            queue_protocol_ << "Обслужено: " << mes << '\n';
         }
-        exit(0);
+        _exit(0);
     }
 
     long GetRandomTime(Params p) {
         static thread_local std::mt19937 gen{std::random_device{}()};
         std::normal_distribution<double> dist(p.mean, p.stddev);
-        return std::max(1L, static_cast<long>(dist(gen)));
+        double val = dist(gen);
+        return std::max(1L, static_cast<long>(val + 0.5));  // округление + защита от ≤0
     }
 
 private:
