@@ -1,18 +1,3 @@
-// main.cpp
-// Лабораторная работа №1: производитель–потребители (АЗС)
-// Реализация: System V shared memory + System V semaphores.
-// Конфиг: config.conf (INI-подобный)
-//
-// Сборка:
-//   g++ -std=c++20 -O2 -pthread -Wall -Wextra -pedantic main.cpp -o gaslab
-//
-// Запуск:
-//   ./gaslab ./config.conf
-//
-// Логи складываются в ./protocols/
-//   - queue.log                    (протокол очереди)
-//   - station_<id>_<АИxx>.log       (протокол каждой колонки)
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -66,15 +51,6 @@ struct Settings {
     int number_message_queue{};      // размер очереди
     int requests{150};               // количество заявок (по методичке >= 150)
 };
-
-// -----------------------------
-// 2) Парсер config.conf
-//    Формат:
-//      number_message_queue = 15
-//      requests = 150
-//      [create] mean=1 stddev=0.5
-//      [station 1] type=0 handle.mean=10 handle.stddev=0.5
-// -----------------------------
 
 static inline std::string Trim(std::string s) {
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
