@@ -19,10 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// -----------------------------
 // 1) Доменные типы (бензин, параметры, настройки)
-// -----------------------------
-
 enum GasType : int { AI76 = 0, AI92 = 1, AI95 = 2 };
 
 static inline std::string_view ToString(GasType t) {
@@ -49,7 +46,7 @@ struct Settings {
     std::vector<Station> stations_params{};
     Params create{};                 // параметры генерации заявок (сек)
     int number_message_queue{};      // размер очереди
-    int requests{150};               // количество заявок (по методичке >= 150)
+    int requests{150};               // количество заявок 
 };
 
 static inline std::string Trim(std::string s) {
@@ -190,7 +187,7 @@ static inline std::optional<Settings> GetSettings(const std::string& path) {
                     std::cerr << "Ошибка конфига (строка " << line_no << "): requests должен быть > 0\n";
                     return std::nullopt;
                 }
-                settings.requests = v; // можем оставить 50, но для лабы лучше 150
+                settings.requests = v; 
                 continue;
             }
 
@@ -251,7 +248,7 @@ static inline std::optional<Settings> GetSettings(const std::string& path) {
         std::cerr << "Ошибка конфига: не задано ни одной станции\n";
         return std::nullopt;
     }
-    // Если генератор не задан, пусть будут разумные значения
+    // Дефолтный
     if (settings.create.mean <= 0) {
         settings.create.mean = 1.0;
         settings.create.stddev = 0.5;
@@ -259,9 +256,7 @@ static inline std::optional<Settings> GetSettings(const std::string& path) {
     return settings;
 }
 
-// -----------------------------
 // 3) IPC структуры (shared memory + semaphores)
-// -----------------------------
 
 // Машина в очереди
 struct Car {
@@ -304,7 +299,7 @@ static inline void DieSys(const char* what) {
     std::exit(1);
 }
 
-// Операция над семафором: -1 (P) ждать, +1 (V) сигналить
+// Операция над семафором: -1 (P) ждать, +1 (V) оповещать
 static inline void SemOp(int semid, unsigned short semnum, short delta) {
     sembuf op{};
     op.sem_num = semnum;
@@ -327,14 +322,14 @@ static inline long long NowMs() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-// Добавить машину в очередь (только внутри SEM_MUTEX!)
+// Добавить машину в очередь
 static inline void Enqueue(ShmHeader* h, const Car& car) {
     Car* cars = ShmCars(h);
     cars[h->size] = car;
     h->size++;
 }
 
-// Забрать первую машину нужного топлива (только внутри SEM_MUTEX!)
+// Забрать первую машину нужного топлива
 static inline bool DequeueFirstMatching(ShmHeader* h, int gas, Car& out) {
     Car* cars = ShmCars(h);
     for (int i = 0; i < h->size; ++i) {
@@ -348,10 +343,7 @@ static inline bool DequeueFirstMatching(ShmHeader* h, int gas, Car& out) {
     return false;
 }
 
-// -----------------------------
 // 4) Процесс станции (потребитель)
-// -----------------------------
-
 static constexpr const char* PROTOCOL_DIR = "protocols";
 
 static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
@@ -371,22 +363,19 @@ static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
     log.flush();
 
     while (true) {
-        // Ждём, пока появится машина нашего топлива (или “пинок” на завершение)
+        // Ожидание машины
         SemOp(semid, fuelSem, -1);
 
-        // Заходим в критическую секцию (семафор Дейкстры P(mutex))
         SemOp(semid, SEM_MUTEX, -1);
 
         Car car{};
         const bool got = DequeueFirstMatching(shm, gas, car);
         const bool finished = (shm->finished != 0);
 
-        // Выходим из критической секции (V(mutex))
         SemOp(semid, SEM_MUTEX, +1);
 
         if (!got) {
-            // Нас разбудили, но машины нет.
-            // Если генератор закончил и очереди для нас больше нет - выходим.
+            // Если генератор закончил - выходим.
             if (finished) break;
             continue;
         }
@@ -394,7 +383,6 @@ static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
         // Освобождаем место в очереди
         SemOp(semid, SEM_EMPTY, +1);
 
-        // Обслуживаем
         const double sec = std::max(0.0, dist(gen));
 
         std::cout << "Станция " << st.id << " (" << ToString(st.type) << ") взяла машину #" << car.id << "\n";
@@ -406,6 +394,7 @@ static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
             << "\n";
         log.flush();
 
+        // Обслуживаем
         std::this_thread::sleep_for(std::chrono::duration<double>(sec));
 
         log << "КОНЕЦ:  станция=" << st.id
@@ -420,10 +409,7 @@ static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
     log.flush();
 }
 
-// -----------------------------
 // 5) Производитель (генератор заявок) - выполняется в родителе
-// -----------------------------
-
 static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm) {
     std::filesystem::create_directory(PROTOCOL_DIR);
     std::ofstream qlog(std::string(PROTOCOL_DIR) + "/queue.log", std::ios::out | std::ios::app);
@@ -432,7 +418,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
     std::normal_distribution<double> genDist(settings.create.mean,
                                             settings.create.stddev > 0 ? settings.create.stddev : 0.001);
 
-    // Распределение топлива как в твоём старом JSON-решении: 2/5, 2/5, 1/5
+    // Распределение топлива 2 2 1
     std::uniform_int_distribution<int> fuelDist(0, 4);
     auto pickFuel = [&]() -> int {
         int v = fuelDist(gen);
@@ -449,7 +435,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
         const int gas = pickFuel();
         Car car{ id, gas, NowMs() };
 
-        // Ждём свободное место в очереди (никаких потерь заявок)
+        // Ждём свободное место в очереди 
         SemOp(semid, SEM_EMPTY, -1);
 
         // Критическая секция: добавляем в shared memory очередь
@@ -458,7 +444,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
         int qsize = shm->size;
         SemOp(semid, SEM_MUTEX, +1);
 
-        // Будим нужные колонки: увеличиваем семафор нужного топлива
+        // Сигнал колонке
         SemOp(semid, FuelSemIndex(gas), +1);
 
         std::cout << "Новая машина #" << car.id << " (" << ToString(static_cast<GasType>(gas))
@@ -477,7 +463,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
     shm->finished = 1;
     SemOp(semid, SEM_MUTEX, +1);
 
-    // Разбудим все станции, чтобы они могли корректно выйти
+    // Сигнал всем станциям, чтобы они могли корректно выйти
     int cnt76 = 0, cnt92 = 0, cnt95 = 0;
     for (const auto& st : settings.stations_params) {
         if (st.type == AI76) cnt76++;
@@ -493,9 +479,6 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
     qlog.flush();
 }
 
-// -----------------------------
-// 6) main: создаём IPC, форкаем станции, запускаем генератор, ждём детей, чистим IPC
-// -----------------------------
 static constexpr const char* FTOK_PATH    = "ipc_keyfile_gaslab";
 
 int main(int argc, char** argv) {
@@ -560,7 +543,7 @@ int main(int argc, char** argv) {
     if (semctl(semid, SEM_FUEL_92, SETVAL, arg) == -1) DieSys("semctl fuel92");
     if (semctl(semid, SEM_FUEL_95, SETVAL, arg) == -1) DieSys("semctl fuel95");
 
-    // Форкаем станции (процессы-потребители)
+    // Создание станций (процессов)
     std::vector<pid_t> stationPids;
     stationPids.reserve(settings.stations_params.size());
 
@@ -589,10 +572,12 @@ int main(int argc, char** argv) {
         waitpid(pid, &status, 0);
     }
 
-    // Родитель чистит IPC (детям нельзя!)
+    // Родитель чистит IPC
     shmdt(mem);
 
+    // удалить сегмент shared memory из системы
     if (shmctl(shmid, IPC_RMID, nullptr) == -1) DieSys("shmctl IPC_RMID");
+    // удалить семафоры из системы
     if (semctl(semid, 0, IPC_RMID) == -1) DieSys("semctl IPC_RMID");
 
     std::filesystem::remove(FTOK_PATH);
