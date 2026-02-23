@@ -353,7 +353,6 @@ static inline bool DequeueFirstMatching(ShmHeader* h, int gas, Car& out) {
 // -----------------------------
 
 static constexpr const char* PROTOCOL_DIR = "protocols";
-static constexpr const char* FTOK_PATH    = "ipc_keyfile_gaslab";
 
 static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
     std::filesystem::create_directory(PROTOCOL_DIR);
@@ -497,6 +496,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
 // -----------------------------
 // 6) main: создаём IPC, форкаем станции, запускаем генератор, ждём детей, чистим IPC
 // -----------------------------
+static constexpr const char* FTOK_PATH    = "ipc_keyfile_gaslab";
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -511,27 +511,18 @@ int main(int argc, char** argv) {
     }
     Settings settings = *settingsOpt;
 
-    // По методичке нужно минимум 150 заявок, но мы не будем тебя силой ломать.
-    // Просто предупредим.
-    if (settings.requests < 150) {
-        std::cerr << "Предупреждение: requests=" << settings.requests
-                  << " (по методичке желательно >= 150)\n";
-    }
 
-    // Подготовим директорию протоколов (можно не удалять, если препод душный)
     std::filesystem::remove_all(PROTOCOL_DIR);
     std::filesystem::create_directory(PROTOCOL_DIR);
 
-    // Файл для ftok (обязателен для генерации key)
     {
-        std::ofstream f(FTOK_PATH, std::ios::out | std::ios::trunc);
-        f << "gaslab\n";
+        std::ofstream f(FTOK_PATH);
     }
 
-    const key_t key = ftok(FTOK_PATH, 42);
+    const key_t key = ftok(FTOK_PATH, 1);
     if (key == -1) DieSys("ftok");
 
-    // Создаём набор семафоров System V
+    // Создаём набор семафоров
     const int semid = semget(key, SEM_COUNT, IPC_CREAT | 0666);
     if (semid == -1) DieSys("semget");
 
