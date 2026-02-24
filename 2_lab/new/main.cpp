@@ -14,311 +14,340 @@
 
 namespace
 {
-constexpr int number_parts = 3;    // этапы
-constexpr int cars_number = 5;
-constexpr int finish_line = 100;
-constexpr int track_len = 50;      // длина полоски
+constexpr int kStageCount = 3;
+constexpr int kCarCount = 5;
 
-std::atomic_bool start_flag {};
-std::atomic_bool next_flag {};
+constexpr int kFinishDistance = 100;
+constexpr int kTrackWidth = 50;
+
+// Сигналы для синхронизации этапов
+std::atomic_bool gStartStageFlag {};
+std::atomic_bool gNextStageFlag {};
 }  // namespace
 
 template <typename... Args>
-static void Print(Args&&... args)
+static void Write(Args&&... args)
 {
     (std::cout << ... << std::forward<Args>(args));
     std::cout.flush();
 }
 
 template <typename... Args>
-static void Println(Args&&... args)
+static void WriteLine(Args&&... args)
 {
     (std::cout << ... << std::forward<Args>(args));
     std::cout << '\n';
     std::cout.flush();
 }
 
+static void ClearTerminal()
+{
+    Write("\033[2J\033[H");
+}
+
 struct ProgressMessage
 {
-    long mtype { 1 };
-    int id {};
-    int progress {};
+    long mtype { 1 };   // для System V msg (тип сообщения)
+    int carId {};
+    int distance {};
     int finished {};
 };
 
-class Car
+struct CarState
 {
-public:
-    void start(int id, int queue)
-    {
-        signal(SIGUSR1, [](int) { start_flag = true; });
-        signal(SIGUSR2, [](int) { next_flag = true; });
-
-        std::mt19937 gen(std::random_device {}());
-        std::uniform_int_distribution<> step_dist(1, 10);
-        std::uniform_int_distribution<> sleep_dist(100, 300);
-
-        for (int stage = 1; stage <= number_parts; ++stage)
-        {
-            while (!start_flag) pause();
-            start_flag = false;
-
-            progress = 0;
-            finished = false;
-            order = 0;
-
-            while (progress < finish_line)
-            {
-                progress = std::min(progress + step_dist(gen), finish_line);
-
-                ProgressMessage msg {};
-                msg.id = id;
-                msg.progress = progress;
-
-                msgsnd(queue, &msg, sizeof(msg) - sizeof(long), 0);
-
-                usleep(sleep_dist(gen) * 1000);
-            }
-
-            ProgressMessage done {};
-            done.id = id;
-            done.progress = progress;
-            done.finished = 1;
-
-            msgsnd(queue, &done, sizeof(done) - sizeof(long), 0);
-
-            if (stage == number_parts) continue;
-
-            while (!next_flag) pause();
-            next_flag = false;
-        }
-    }
-
-    int progress {};
-    int order {};      // место на этапе (1..cars_number)
-    int points {};     // суммарные очки (меньше = лучше)
-    bool finished {};
+    int distance { 0 };
+    int stagePlace { 0 };     // 1..kCarCount
+    int totalScore { 0 };     // меньше = лучше
+    bool finishedStage { false };
 };
 
-class Arbiter
+class CarProcess
 {
 public:
-    ~Arbiter()
+    void Run(int carId, int progressQueueId)
     {
-        msgctl(progress_queue, IPC_RMID, nullptr);
+        // Получаем сигналы от судьи
+        signal(SIGUSR1, [](int) { gStartStageFlag = true; });
+        signal(SIGUSR2, [](int) { gNextStageFlag = true; });
+
+        std::mt19937 rng(std::random_device {}());
+        std::uniform_int_distribution<int> stepDist(1, 10);
+        std::uniform_int_distribution<int> sleepDist(100, 300);
+
+        for (int stage = 1; stage <= kStageCount; ++stage)
+        {
+            // Ждём старт этапа
+            while (!gStartStageFlag) pause();
+            gStartStageFlag = false;
+
+            int distance = 0;
+
+            // Едем до финиша, отправляя прогресс судье
+            while (distance < kFinishDistance)
+            {
+                distance = std::min(distance + stepDist(rng), kFinishDistance);
+
+                ProgressMessage msg {};
+                msg.carId = carId;
+                msg.distance = distance;
+                msg.finished = 0;
+
+                msgsnd(progressQueueId, &msg, sizeof(msg) - sizeof(long), 0);
+                usleep(sleepDist(rng) * 1000);
+            }
+
+            // Сообщаем "я финишировал"
+            ProgressMessage done {};
+            done.carId = carId;
+            done.distance = distance;
+            done.finished = 1;
+
+            msgsnd(progressQueueId, &done, sizeof(done) - sizeof(long), 0);
+
+            if (stage == kStageCount) continue;
+
+            // Ждём разрешения на следующий этап
+            while (!gNextStageFlag) pause();
+            gNextStageFlag = false;
+        }
+    }
+};
+
+class RaceController
+{
+public:
+    RaceController()
+        : progressQueueId_(msgget(IPC_PRIVATE, IPC_CREAT | 0666))
+    {
     }
 
-    void prepare()
+    ~RaceController()
     {
-        for (int i = 0; i < cars_number; ++i)
+        msgctl(progressQueueId_, IPC_RMID, nullptr);
+    }
+
+    void SpawnCars()
+    {
+        for (int i = 0; i < kCarCount; ++i)
         {
             pid_t pid = fork();
 
             if (pid == 0)
             {
-                if (i == 0) process_group = getpid();
-                setpgid(0, process_group);
+                // Ребёнок: в одну группу процессов, чтобы kill(-pgid, SIGxxx) работал
+                if (i == 0) processGroupId_ = getpid();
+                setpgid(0, processGroupId_);
 
-                cars[i].start(i, progress_queue);
+                CarProcess car;
+                car.Run(i, progressQueueId_);
                 std::exit(0);
             }
 
-            processes[i] = pid;
+            // Родитель
+            carPids_[i] = pid;
 
-            if (i == 0) process_group = pid;
-            setpgid(pid, process_group);
+            if (i == 0) processGroupId_ = pid;
+            setpgid(pid, processGroupId_);
         }
     }
 
-    void start()
+    void RunRace()
     {
         std::cin.clear();
 
-        for (int stage = 1; stage <= number_parts; ++stage)
+        for (int stage = 1; stage <= kStageCount; ++stage)
         {
-            current_stage = stage;
-            finish_order_counter = 0;
+            RunStage(stage);
 
-            for (auto& car : cars)
+            if (stage == kStageCount)
             {
-                car.progress = 0;
-                car.order = 0;
-                car.finished = false;
-                // points не трогаем (копим)
+                WriteLine("\nГонка завершена");
             }
-
-            ClearScreen();
-            Println("Этап ", stage, "/", number_parts, "\n");
-            Println("Подготовка этапа ", stage);
-            sleep(1);
-
-            // стартуем машины
-            kill(-process_group, SIGUSR1);
-
-            unsigned finished_count = 0;
-
-            while (finished_count < cars_number)
+            else
             {
-                ProgressMessage msg {};
+                WriteLine("\n----------------------------------------");
+                WriteLine("Жми Enter для следующего этапа...");
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
-                // читаем все доступные сообщения
-                while (msgrcv(progress_queue, &msg,
-                              sizeof(msg) - sizeof(long),
-                              0, IPC_NOWAIT) > 0)
-                {
-                    Car& car = cars[msg.id];
-                    car.progress = msg.progress;
-
-                    if (msg.finished && !car.finished)
-                    {
-                        car.finished = true;
-                        car.order = ++finish_order_counter;
-                        car.points += car.order; // меньше очков = лучше
-                    }
-                }
-
-                finished_count = 0;
-                for (const auto& car : cars)
-                    if (car.finished) ++finished_count;
-
-                DisplayProgressMpiStyle();
-                usleep(200000);
+                // Разрешаем всем машинам переходить к следующему этапу
+                kill(-processGroupId_, SIGUSR2);
             }
-
-            DisplayPoints();
-
-            if (stage == number_parts)
-            {
-                Println("\nГонка завершена");
-                continue;
-            }
-
-            Println("\n----------------------------------------");
-            Println("Жми Enter для следующего этапа...");
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-            // следующий этап
-            kill(-process_group, SIGUSR2);
         }
 
-        DisplayResults();
+        ShowFinalStandings();
 
-        for (const auto& pid : processes)
+        for (pid_t pid : carPids_)
             waitpid(pid, nullptr, 0);
     }
 
 private:
-    static void ClearScreen()
+    void RunStage(int stageNumber)
     {
-        Print("\033[2J\033[H");
+        currentStage_ = stageNumber;
+        nextFinishPlace_ = 0;
+
+        // Сброс состояния этапа (очки копим)
+        for (auto& car : cars_)
+        {
+            car.distance = 0;
+            car.stagePlace = 0;
+            car.finishedStage = false;
+        }
+
+        ClearTerminal();
+        WriteLine("Этап ", stageNumber, "/", kStageCount, "\n");
+        WriteLine("Подготовка этапа ", stageNumber);
+        sleep(1);
+
+        // Стартуем этап
+        kill(-processGroupId_, SIGUSR1);
+
+        while (!AllCarsFinishedStage())
+        {
+            DrainProgressQueue();
+            RenderStageFrame();
+            usleep(200000);
+        }
+
+        // На всякий: дочитать остатки, если прилетели после последнего цикла
+        DrainProgressQueue();
+
+        ShowStageStandings();
     }
 
-    // интерфейс как в MPI + число/100
-    void DisplayProgressMpiStyle() const
+    bool AllCarsFinishedStage() const
     {
-        ClearScreen();
-        Println("Этап ", current_stage, "/", number_parts, "\n");
+        for (const auto& car : cars_)
+            if (!car.finishedStage) return false;
+        return true;
+    }
 
-        for (int r = 0; r < cars_number; ++r)
+    void DrainProgressQueue()
+    {
+        ProgressMessage msg {};
+
+        while (msgrcv(progressQueueId_, &msg,
+                      sizeof(msg) - sizeof(long),
+                      0, IPC_NOWAIT) > 0)
         {
-            const Car& car = cars[r];
+            auto& car = cars_.at(msg.carId);
+            car.distance = msg.distance;
 
-            int p = (car.progress * track_len) / finish_line;
-            p = std::clamp(p, 0, track_len);
+            if (msg.finished && !car.finishedStage)
+            {
+                car.finishedStage = true;
+                car.stagePlace = ++nextFinishPlace_;
+
+                // Меньше очков = лучше. 1 место добавляет 1, 5 место добавляет 5.
+                car.totalScore += car.stagePlace;
+            }
+        }
+    }
+
+    void RenderStageFrame() const
+    {
+        ClearTerminal();
+        WriteLine("Этап ", currentStage_, "/", kStageCount, "\n");
+
+        for (int i = 0; i < kCarCount; ++i)
+        {
+            const auto& car = cars_[i];
+
+            int markerPos = (car.distance * kTrackWidth) / kFinishDistance;
+            markerPos = std::clamp(markerPos, 0, kTrackWidth);
 
             std::string line;
-            line.reserve(track_len + 1);
-            line.append(p, '-');
+            line.reserve(kTrackWidth + 1);
+            line.append(markerPos, '-');
             line.push_back('>');
-            line.append(track_len - p, ' ');
+            line.append(kTrackWidth - markerPos, ' ');
 
-            Print("car ", (r + 1), " |", line, "| ",
-                  car.progress, " / ", finish_line);
+            Write("car ", (i + 1), " |", line, "| ",
+                  car.distance, " / ", kFinishDistance);
 
-            if (car.finished)
-                Print("  (place: ", car.order, ")");
+            if (car.finishedStage)
+                Write("  (place: ", car.stagePlace, ")");
 
-            Println();
+            WriteLine();
         }
     }
 
-    void DisplayPoints() const
+    void ShowStageStandings() const
     {
-        Println("\nРезультаты этапа:");
+        WriteLine("\nРезультаты этапа:");
 
-        std::array<const Car*, cars_number> order_ptrs {};
-        for (int i = 0; i < cars_number; ++i)
-            order_ptrs[i] = &cars[i];
+        std::array<const CarState*, kCarCount> order {};
+        for (int i = 0; i < kCarCount; ++i)
+            order[i] = &cars_[i];
 
-        auto idx = [&](const Car* c) -> int {
-            return static_cast<int>(c - &cars[0]); // 0..cars_number-1
+        auto CarIndex = [&](const CarState* c) -> int {
+            return static_cast<int>(c - &cars_[0]);
         };
 
-        // Стабильно: сначала по order, если равны (на всякий) по номеру машины
-        std::sort(order_ptrs.begin(), order_ptrs.end(),
-                  [&](const Car* a, const Car* b)
+        std::sort(order.begin(), order.end(),
+                  [&](const CarState* a, const CarState* b)
                   {
-                      if (a->order != b->order) return a->order < b->order;
-                      return idx(a) < idx(b);
+                      if (a->stagePlace != b->stagePlace) return a->stagePlace < b->stagePlace;
+                      return CarIndex(a) < CarIndex(b);
                   });
 
-        for (int place = 0; place < cars_number; ++place)
+        for (int place = 0; place < kCarCount; ++place)
         {
-            const Car* car = order_ptrs[place];
-            int car_no = idx(car) + 1;
+            const CarState* car = order[place];
+            int carNumber = CarIndex(car) + 1;
 
-            Println("Место ", place + 1,
-                    ": Машина ", car_no,
-                    " (Очки: ", car->points, ")");
+            WriteLine("Место ", place + 1,
+                      ": Машина ", carNumber,
+                      " (Очки: ", car->totalScore, ")");
         }
     }
 
-    void DisplayResults() const
+    void ShowFinalStandings() const
     {
-        Println("\n=== Итоги ===");
+        WriteLine("\n=== Итоги ===");
 
-        std::array<const Car*, cars_number> score_ptrs {};
-        for (int i = 0; i < cars_number; ++i)
-            score_ptrs[i] = &cars[i];
+        std::array<const CarState*, kCarCount> ranking {};
+        for (int i = 0; i < kCarCount; ++i)
+            ranking[i] = &cars_[i];
 
-        auto idx = [&](const Car* c) -> int {
-            return static_cast<int>(c - &cars[0]); // 0..cars_number-1
+        auto CarIndex = [&](const CarState* c) -> int {
+            return static_cast<int>(c - &cars_[0]);
         };
 
-        // Стабильно: меньше очков лучше, при равенстве меньше номер машины лучше
-        std::sort(score_ptrs.begin(), score_ptrs.end(),
-                  [&](const Car* a, const Car* b)
+        std::sort(ranking.begin(), ranking.end(),
+                  [&](const CarState* a, const CarState* b)
                   {
-                      if (a->points != b->points) return a->points < b->points;
-                      return idx(a) < idx(b);
+                      if (a->totalScore != b->totalScore) return a->totalScore < b->totalScore;
+                      return CarIndex(a) < CarIndex(b);
                   });
 
-        for (int place = 0; place < cars_number; ++place)
+        for (int place = 0; place < kCarCount; ++place)
         {
-            const Car* car = score_ptrs[place];
-            int car_no = idx(car) + 1;
+            const CarState* car = ranking[place];
+            int carNumber = CarIndex(car) + 1;
 
-            Println("Место ", place + 1,
-                    ": Машина ", car_no,
-                    " (Всего очков: ", car->points, ")");
+            WriteLine("Место ", place + 1,
+                      ": Машина ", carNumber,
+                      " (Всего очков: ", car->totalScore, ")");
         }
     }
 
 private:
-    std::array<pid_t, cars_number> processes {};
-    pid_t process_group {};
+    std::array<pid_t, kCarCount> carPids_ {};
+    pid_t processGroupId_ {};
 
-    int progress_queue { msgget(IPC_PRIVATE, IPC_CREAT | 0666) };
+    int progressQueueId_ {};
 
-    int current_stage {};
-    int finish_order_counter {};
-    std::array<Car, cars_number> cars {};
+    int currentStage_ {};
+    int nextFinishPlace_ {};
+
+    std::array<CarState, kCarCount> cars_ {};
 };
 
 int main()
 {
-    Arbiter arbiter;
-    arbiter.prepare();
-    arbiter.start();
+    RaceController race;
+    race.SpawnCars();
+    race.RunRace();
     return 0;
 }
