@@ -1,18 +1,26 @@
+#include <sys/ipc.h>
 #include <sys/msg.h>
+#include <sys/shm.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <csignal>
-#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
 #include <string>
 
-namespace
+// =============================
+// Константы (чисто и явно)
+// =============================
+namespace cfg
 {
 constexpr int kStageCount = 3;
 constexpr int kCarCount = 5;
@@ -20,10 +28,25 @@ constexpr int kCarCount = 5;
 constexpr int kFinishDistance = 100;
 constexpr int kTrackWidth = 50;
 
-// Сигналы для синхронизации этапов
-std::atomic_bool gStartStageFlag {};
-std::atomic_bool gNextStageFlag {};
-}  // namespace
+constexpr char kFtokPath[] = "./ipc_keyfile_lab2";
+constexpr int kProjMsg = 0x42;
+constexpr int kProjShm = 0x43;
+
+// Частота обновления экрана
+constexpr useconds_t kRenderSleepUs = 200'000;
+
+// Пауза ожиданий (старт/барьер)
+constexpr useconds_t kWaitSleepUs = 1'000;
+}  // namespace cfg
+
+// =============================
+// Утилиты
+// =============================
+static void DieSys(const char* what)
+{
+    std::cerr << what << ": " << std::strerror(errno) << "\n";
+    std::exit(1);
+}
 
 template <typename... Args>
 static void Write(Args&&... args)
@@ -45,109 +68,153 @@ static void ClearTerminal()
     Write("\033[2J\033[H");
 }
 
+// =============================
+// SysV Messages: прогресс машин
+// =============================
 struct ProgressMessage
 {
-    long mtype { 1 };   // для System V msg (тип сообщения)
-    int carId {};
-    int distance {};
-    int finished {};
+    long mtype{1};       // тип для msg queue
+    int carId{};
+    int distance{};      // 0..kFinishDistance
+    int finished{};      // 0/1
 };
 
-struct CarState
+// =============================
+// Shared state: общий сигнал + барьер
+// =============================
+// ВАЖНО: это "разделяемый ресурс", доступный всем процессам.
+// Тут и есть "общий сигнал в единственном экземпляре для всех участников". :contentReference[oaicite:5]{index=5}
+struct SharedState
 {
-    int distance { 0 };
-    int stagePlace { 0 };     // 1..kCarCount
-    int totalScore { 0 };     // меньше = лучше
-    bool finishedStage { false };
+    // Текущий этап, который разрешено начинать (0..kStageCount)
+    int startStage{0};
+
+    // Текущий этап, который разрешено завершить и перейти дальше (0..kStageCount)
+    int releaseStage{0};
+
+    // Массив состояния: какой этап уже достиг барьера каждой машиной
+    // (0 = ещё ничего, 1..kStageCount = дошёл до конца этапа N)
+    int arrivedStage[cfg::kCarCount]{};
 };
 
+// =============================
+// Машина-процесс
+// =============================
 class CarProcess
 {
 public:
-    void Run(int carId, int progressQueueId)
+    void Run(int carId, int progressQueueId, SharedState* shared)
     {
-        // Получаем сигналы от судьи
-        signal(SIGUSR1, [](int) { gStartStageFlag = true; });
-        signal(SIGUSR2, [](int) { gNextStageFlag = true; });
+        std::mt19937 rng(static_cast<unsigned>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count()
+            ^ (carId * 0x9e3779b9u)));
 
-        std::mt19937 rng(std::random_device {}());
         std::uniform_int_distribution<int> stepDist(1, 10);
         std::uniform_int_distribution<int> sleepDist(100, 300);
 
-        for (int stage = 1; stage <= kStageCount; ++stage)
+        for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
-            // Ждём старт этапа
-            while (!gStartStageFlag) pause();
-            gStartStageFlag = false;
+            // ---- Ожидаем общий старт-сигнал (в единственном экземпляре) ----
+            // Арбитр ставит shared->startStage = stage один раз,
+            // а все процессы просто читают эту одну общую переменную. 
+            while (shared->startStage < stage)
+                usleep(cfg::kWaitSleepUs);
 
             int distance = 0;
 
-            // Едем до финиша, отправляя прогресс судье
-            while (distance < kFinishDistance)
+            // ---- Едем, периодически отправляя прогресс арбитру через сообщения ----
+            while (distance < cfg::kFinishDistance)
             {
-                distance = std::min(distance + stepDist(rng), kFinishDistance);
+                distance = std::min(cfg::kFinishDistance, distance + stepDist(rng));
 
-                ProgressMessage msg {};
+                ProgressMessage msg{};
                 msg.carId = carId;
                 msg.distance = distance;
                 msg.finished = 0;
 
-                msgsnd(progressQueueId, &msg, sizeof(msg) - sizeof(long), 0);
-                usleep(sleepDist(rng) * 1000);
+                if (msgsnd(progressQueueId, &msg, sizeof(msg) - sizeof(long), 0) == -1)
+                    DieSys("msgsnd(progress)");
+
+                usleep(static_cast<useconds_t>(sleepDist(rng) * 1000));
             }
 
-            // Сообщаем "я финишировал"
-            ProgressMessage done {};
+            // ---- Сообщаем "финиш этапа" ----
+            ProgressMessage done{};
             done.carId = carId;
-            done.distance = distance;
+            done.distance = cfg::kFinishDistance;
             done.finished = 1;
 
-            msgsnd(progressQueueId, &done, sizeof(done) - sizeof(long), 0);
+            if (msgsnd(progressQueueId, &done, sizeof(done) - sizeof(long), 0) == -1)
+                DieSys("msgsnd(done)");
 
-            if (stage == kStageCount) continue;
+            // ---- Барьер: отмечаемся в массиве состояния ---- 
+            shared->arrivedStage[carId] = stage;
 
-            // Ждём разрешения на следующий этап
-            while (!gNextStageFlag) pause();
-            gNextStageFlag = false;
+            // ---- Ждём "разрешение продолжать" от арбитра (общий сигнал) ----
+            // Арбитр выставляет shared->releaseStage = stage, когда все отметились.
+            while (shared->releaseStage < stage)
+                usleep(cfg::kWaitSleepUs);
         }
     }
 };
 
+// =============================
+// Судья/арбитр (управляющий процесс)
+// =============================
 class RaceController
 {
 public:
     RaceController()
-        : progressQueueId_(msgget(IPC_PRIVATE, IPC_CREAT | 0666))
     {
+        EnsureFtokFile();
+
+        const key_t msgKey = ftok(cfg::kFtokPath, cfg::kProjMsg);
+        if (msgKey == -1) DieSys("ftok(msgKey)");
+
+        const key_t shmKey = ftok(cfg::kFtokPath, cfg::kProjShm);
+        if (shmKey == -1) DieSys("ftok(shmKey)");
+
+        progressQueueId_ = msgget(msgKey, IPC_CREAT | 0666);
+        if (progressQueueId_ == -1) DieSys("msgget");
+
+        shmId_ = shmget(shmKey, sizeof(SharedState), IPC_CREAT | 0666);
+        if (shmId_ == -1) DieSys("shmget");
+
+        shared_ = static_cast<SharedState*>(shmat(shmId_, nullptr, 0));
+        if (shared_ == reinterpret_cast<void*>(-1)) DieSys("shmat");
+
+        // Инициализация разделяемого состояния
+        *shared_ = SharedState{};
     }
 
     ~RaceController()
     {
-        msgctl(progressQueueId_, IPC_RMID, nullptr);
+        // Дети уже должны завершиться, теперь чистим ресурсы
+        if (shared_ && shared_ != reinterpret_cast<void*>(-1))
+            shmdt(shared_);
+
+        if (shmId_ != -1)
+            shmctl(shmId_, IPC_RMID, nullptr);
+
+        if (progressQueueId_ != -1)
+            msgctl(progressQueueId_, IPC_RMID, nullptr);
     }
 
     void SpawnCars()
     {
-        for (int i = 0; i < kCarCount; ++i)
+        for (int carId = 0; carId < cfg::kCarCount; ++carId)
         {
-            pid_t pid = fork();
+            const pid_t pid = fork();
+            if (pid == -1) DieSys("fork");
 
             if (pid == 0)
             {
-                // Ребёнок: в одну группу процессов, чтобы kill(-pgid, SIGxxx) работал
-                if (i == 0) processGroupId_ = getpid();
-                setpgid(0, processGroupId_);
-
                 CarProcess car;
-                car.Run(i, progressQueueId_);
+                car.Run(carId, progressQueueId_, shared_);
                 std::exit(0);
             }
 
-            // Родитель
-            carPids_[i] = pid;
-
-            if (i == 0) processGroupId_ = pid;
-            setpgid(pid, processGroupId_);
+            carPids_[carId] = pid;
         }
     }
 
@@ -155,11 +222,13 @@ public:
     {
         std::cin.clear();
 
-        for (int stage = 1; stage <= kStageCount; ++stage)
+        for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
             RunStage(stage);
 
-            if (stage == kStageCount)
+            ShowStageStandings(stage);
+
+            if (stage == cfg::kStageCount)
             {
                 WriteLine("\nГонка завершена");
             }
@@ -168,9 +237,6 @@ public:
                 WriteLine("\n----------------------------------------");
                 WriteLine("Жми Enter для следующего этапа...");
                 std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-                // Разрешаем всем машинам переходить к следующему этапу
-                kill(-processGroupId_, SIGUSR2);
             }
         }
 
@@ -181,124 +247,152 @@ public:
     }
 
 private:
-    void RunStage(int stageNumber)
+    struct CarView
     {
-        currentStage_ = stageNumber;
+        int distance{0};
+        int stagePlace{0};     // 1..kCarCount
+        int totalScore{0};     // меньше = лучше
+        bool finished{false};
+    };
+
+    void RunStage(int stage)
+    {
+        currentStage_ = stage;
         nextFinishPlace_ = 0;
 
-        // Сброс состояния этапа (очки копим)
+        // Сброс состояния этапа (очки копятся)
         for (auto& car : cars_)
         {
             car.distance = 0;
             car.stagePlace = 0;
-            car.finishedStage = false;
+            car.finished = false;
         }
 
+        // Сброс барьерного массива для данного этапа (формально необязателен,
+        // но так чище и преподу приятнее)
+        for (int i = 0; i < cfg::kCarCount; ++i)
+            shared_->arrivedStage[i] = 0;
+
+        // "Подготовка"
         ClearTerminal();
-        WriteLine("Этап ", stageNumber, "/", kStageCount, "\n");
-        WriteLine("Подготовка этапа ", stageNumber);
+        WriteLine("Этап ", stage, "/", cfg::kStageCount, "\n");
+        WriteLine("Подготовка этапа ", stage);
         sleep(1);
 
-        // Стартуем этап
-        kill(-processGroupId_, SIGUSR1);
+        // ---- Общий старт-сигнал в одном экземпляре ----
+        // Одно присваивание, общий разделяемый ресурс, доступ всем сразу. 
+        shared_->startStage = stage;
 
-        while (!AllCarsFinishedStage())
+        // Основной цикл: читаем сообщения о прогрессе и рисуем
+        while (!AllCarsFinished())
         {
             DrainProgressQueue();
-            RenderStageFrame();
-            usleep(200000);
+            RenderFrame();
+            usleep(cfg::kRenderSleepUs);
         }
 
-        // На всякий: дочитать остатки, если прилетели после последнего цикла
+        // Добираем хвост сообщений (чтобы не тащились в следующий этап)
         DrainProgressQueue();
 
-        ShowStageStandings();
-    }
+        // ---- Барьер: ждём, пока все машины отметятся в массиве arrivedStage ---- 
+        while (!AllCarsArrivedBarrier(stage))
+            usleep(cfg::kWaitSleepUs);
 
-    bool AllCarsFinishedStage() const
-    {
-        for (const auto& car : cars_)
-            if (!car.finishedStage) return false;
-        return true;
+        // ---- Разрешаем всем продолжать (один общий сигнал) ----
+        shared_->releaseStage = stage;
     }
 
     void DrainProgressQueue()
     {
-        ProgressMessage msg {};
+        ProgressMessage msg{};
 
-        while (msgrcv(progressQueueId_, &msg,
-                      sizeof(msg) - sizeof(long),
-                      0, IPC_NOWAIT) > 0)
+        while (msgrcv(progressQueueId_, &msg, sizeof(msg) - sizeof(long), 0, IPC_NOWAIT) > 0)
         {
-            auto& car = cars_.at(msg.carId);
+            if (msg.carId < 0 || msg.carId >= cfg::kCarCount)
+                continue;
+
+            auto& car = cars_[msg.carId];
             car.distance = msg.distance;
 
-            if (msg.finished && !car.finishedStage)
+            if (msg.finished && !car.finished)
             {
-                car.finishedStage = true;
+                car.finished = true;
                 car.stagePlace = ++nextFinishPlace_;
-
-                // Меньше очков = лучше. 1 место добавляет 1, 5 место добавляет 5.
-                car.totalScore += car.stagePlace;
+                car.totalScore += car.stagePlace; // меньше = лучше
             }
         }
+
+        if (errno != ENOMSG && errno != 0)
+            errno = 0; // не мешаем жить после ENOMSG
     }
 
-    void RenderStageFrame() const
+    bool AllCarsFinished() const
+    {
+        for (const auto& car : cars_)
+            if (!car.finished) return false;
+        return true;
+    }
+
+    bool AllCarsArrivedBarrier(int stage) const
+    {
+        for (int i = 0; i < cfg::kCarCount; ++i)
+            if (shared_->arrivedStage[i] < stage) return false;
+        return true;
+    }
+
+    void RenderFrame() const
     {
         ClearTerminal();
-        WriteLine("Этап ", currentStage_, "/", kStageCount, "\n");
+        WriteLine("Этап ", currentStage_, "/", cfg::kStageCount, "\n");
 
-        for (int i = 0; i < kCarCount; ++i)
+        for (int i = 0; i < cfg::kCarCount; ++i)
         {
             const auto& car = cars_[i];
 
-            int markerPos = (car.distance * kTrackWidth) / kFinishDistance;
-            markerPos = std::clamp(markerPos, 0, kTrackWidth);
+            int markerPos = (car.distance * cfg::kTrackWidth) / cfg::kFinishDistance;
+            markerPos = std::clamp(markerPos, 0, cfg::kTrackWidth);
 
             std::string line;
-            line.reserve(kTrackWidth + 1);
+            line.reserve(cfg::kTrackWidth + 1);
             line.append(markerPos, '-');
             line.push_back('>');
-            line.append(kTrackWidth - markerPos, ' ');
+            line.append(cfg::kTrackWidth - markerPos, ' ');
 
             Write("car ", (i + 1), " |", line, "| ",
-                  car.distance, " / ", kFinishDistance);
+                  car.distance, " / ", cfg::kFinishDistance);
 
-            if (car.finishedStage)
+            if (car.finished)
                 Write("  (place: ", car.stagePlace, ")");
 
             WriteLine();
         }
     }
 
-    void ShowStageStandings() const
+    void ShowStageStandings(int stage) const
     {
-        WriteLine("\nРезультаты этапа:");
+        WriteLine("\nРезультаты этапа ", stage, ":");
 
-        std::array<const CarState*, kCarCount> order {};
-        for (int i = 0; i < kCarCount; ++i)
+        std::array<const CarView*, cfg::kCarCount> order{};
+        for (int i = 0; i < cfg::kCarCount; ++i)
             order[i] = &cars_[i];
 
-        auto CarIndex = [&](const CarState* c) -> int {
+        auto IndexOf = [&](const CarView* c) -> int {
             return static_cast<int>(c - &cars_[0]);
         };
 
+        // Стабильно: по месту этапа, при равенстве по номеру машины
         std::sort(order.begin(), order.end(),
-                  [&](const CarState* a, const CarState* b)
+                  [&](const CarView* a, const CarView* b)
                   {
                       if (a->stagePlace != b->stagePlace) return a->stagePlace < b->stagePlace;
-                      return CarIndex(a) < CarIndex(b);
+                      return IndexOf(a) < IndexOf(b);
                   });
 
-        for (int place = 0; place < kCarCount; ++place)
+        for (int place = 0; place < cfg::kCarCount; ++place)
         {
-            const CarState* car = order[place];
-            int carNumber = CarIndex(car) + 1;
-
-            WriteLine("Место ", place + 1,
-                      ": Машина ", carNumber,
-                      " (Очки: ", car->totalScore, ")");
+            const CarView* car = order[place];
+            const int carNo = IndexOf(car) + 1;
+            WriteLine("Место ", place + 1, ": Машина ", carNo, " (Очки: ", car->totalScore, ")");
         }
     }
 
@@ -306,42 +400,52 @@ private:
     {
         WriteLine("\n=== Итоги ===");
 
-        std::array<const CarState*, kCarCount> ranking {};
-        for (int i = 0; i < kCarCount; ++i)
+        std::array<const CarView*, cfg::kCarCount> ranking{};
+        for (int i = 0; i < cfg::kCarCount; ++i)
             ranking[i] = &cars_[i];
 
-        auto CarIndex = [&](const CarState* c) -> int {
+        auto IndexOf = [&](const CarView* c) -> int {
             return static_cast<int>(c - &cars_[0]);
         };
 
+        // Стабильно: меньше очков лучше, при равенстве по номеру машины
         std::sort(ranking.begin(), ranking.end(),
-                  [&](const CarState* a, const CarState* b)
+                  [&](const CarView* a, const CarView* b)
                   {
                       if (a->totalScore != b->totalScore) return a->totalScore < b->totalScore;
-                      return CarIndex(a) < CarIndex(b);
+                      return IndexOf(a) < IndexOf(b);
                   });
 
-        for (int place = 0; place < kCarCount; ++place)
+        for (int place = 0; place < cfg::kCarCount; ++place)
         {
-            const CarState* car = ranking[place];
-            int carNumber = CarIndex(car) + 1;
-
-            WriteLine("Место ", place + 1,
-                      ": Машина ", carNumber,
-                      " (Всего очков: ", car->totalScore, ")");
+            const CarView* car = ranking[place];
+            const int carNo = IndexOf(car) + 1;
+            WriteLine("Место ", place + 1, ": Машина ", carNo, " (Всего очков: ", car->totalScore, ")");
         }
     }
 
+    static void EnsureFtokFile()
+    {
+        // ftok требует существующий файл
+        std::ifstream in(cfg::kFtokPath);
+        if (in.good()) return;
+
+        std::ofstream out(cfg::kFtokPath, std::ios::out | std::ios::trunc);
+        if (!out) DieSys("create ftok file");
+        out << "lab2\n";
+    }
+
 private:
-    std::array<pid_t, kCarCount> carPids_ {};
-    pid_t processGroupId_ {};
+    int progressQueueId_{-1};
 
-    int progressQueueId_ {};
+    int shmId_{-1};
+    SharedState* shared_{nullptr};
 
-    int currentStage_ {};
-    int nextFinishPlace_ {};
+    int currentStage_{0};
+    int nextFinishPlace_{0};
 
-    std::array<CarState, kCarCount> cars_ {};
+    std::array<pid_t, cfg::kCarCount> carPids_{};
+    std::array<CarView, cfg::kCarCount> cars_{};
 };
 
 int main()
