@@ -19,20 +19,20 @@
 #include <string>
 #include <vector>
 
-// =============================
 // Константы
-// =============================
 namespace cfg
 {
+// этапы
 constexpr int kStageCount = 3;
+// кол-во машин 
 constexpr int kCarCount = 5;
 
 constexpr int kFinishDistance = 100;
 constexpr int kTrackWidth = 50;
 
 constexpr char kFtokPath[] = "./ipc_keyfile_lab2";
-constexpr int kProjMsg = 0x42;
-constexpr int kProjShm = 0x43;
+constexpr int kProjMsg = 1;
+constexpr int kProjShm = 1;
 
 // Файлы блокировки этапов (3 штуки)
 constexpr char kStageLock1[] = "./stage1.lock";
@@ -41,11 +41,9 @@ constexpr char kStageLock3[] = "./stage3.lock";
 
 constexpr useconds_t kRenderSleepUs = 200'000;
 constexpr useconds_t kWaitSleepUs = 1'000;
-}  // namespace cfg
+}  
 
-// =============================
 // Утилиты
-// =============================
 static void DieSys(const char* what)
 {
     std::cerr << what << ": " << std::strerror(errno) << "\n";
@@ -72,6 +70,7 @@ static void ClearTerminal()
     Write("\033[2J\033[H");
 }
 
+// Создает файл, если его нет
 static void EnsureFileExists(const char* path)
 {
     std::ifstream in(path);
@@ -82,6 +81,7 @@ static void EnsureFileExists(const char* path)
     out << "lock\n";
 }
 
+// Выбирает правильный stageN.lock
 static int OpenStageLockFile(int stage)
 {
     const char* path = nullptr;
@@ -93,55 +93,62 @@ static int OpenStageLockFile(int stage)
         default: DieSys("bad stage"); break;
     }
 
-    int fd = ::open(path, O_RDWR | O_CREAT, 0666);
-    if (fd == -1) DieSys("open(stage lock file)");
-    return fd;
+    int fileDescriptor = ::open(path, O_RDWR | O_CREAT, 0666);
+    if (fileDescriptor == -1) DieSys("open(stage lock file)");
+    return fileDescriptor;
 }
 
-// =============================
 // SysV Messages: прогресс машин
-// =============================
 struct ProgressMessage
 {
+    // Тип сообщения для SysV очереди. один поток сообщений, поэтому фиксируем 1
     long mtype{1};
+
     int carId{};
+    //Текущая пройденная дистанция на этап
     int distance{};
+    //Флаг завершения этапа
     int finished{};
 };
 
-// =============================
-// Shared state: барьер
-// =============================
+/// Shared memory для барьерной синхронизации между машинами и арбитром.
+/// Используется для отметки завершения этапа и разрешения перехода дальше.
 struct SharedState
 {
-    // На каком этапе уже разрешили продолжить (0..kStageCount)
+    /// Номер этапа, для которого арбитр разрешил продолжение.
+    /// Машины ждут, пока releaseStage >= текущий этап.
     int releaseStage{0};
 
-    // Массив состояния: до какого этапа дошла каждая машина (0..kStageCount)
+    /// arrivedStage[i] = N означает, что машина i
+    /// завершила этап N и вошла в барьер.
     int arrivedStage[cfg::kCarCount]{};
 };
 
-// =============================
 // Машина-процесс
-// =============================
 class CarProcess
 {
 public:
-    // inheritedStageLockFds: fd, которые родитель держал залоченными при fork (их надо закрыть в child)
+    /// @brief Основной цикл работы процесса машины. Выполняет все этапы гонки: ожидает старт через файловую блокировку, отправляет прогресс в очередь сообщений, отмечается в барьере и ждёт разрешения на переход к следующему этапу.
+    /// @param carId Идентификатор машины (0..kCarCount-1). Используется для маркировки сообщений и индексации в массиве барьера.
+    /// @param progressQueueId Идентификатор очереди сообщений System V. Через неё машина отправляет арбитру обновления прогресса и сигнал о завершении этапа.
+    /// @param shared Указатель на сегмент разделяемой памяти (SharedState). Используется для барьерной синхронизации: - arrivedStage[carId] — отметка о достижении барьера, - releaseStage — разрешение от арбитра продолжить выполнение. 
+    /// @param inheritedStageLockFds Дескрипторы файлов этапов, унаследованные после fork(). В дочернем процессе должны быть закрыты, чтобы корректно работала блокировка flock при ожидании старта этапа.
     void Run(int carId, int progressQueueId, SharedState* shared,
              const std::vector<int>& inheritedStageLockFds)
     {
-        // Критично: закрываем унаследованные fd лок-файлов,
-        // иначе ребёнок "унаследует" эксклюзивный lock и не будет блокироваться.
+        // закрываем унаследованные fd лок-файлов
+        // дочерний процесс забрал все открытые fd родителя
         for (int fd : inheritedStageLockFds)
         {
             if (fd >= 0) ::close(fd);
         }
 
+        // настройка сида рандома для каждой машины своё
         std::mt19937 rng(static_cast<unsigned>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count()
             ^ (carId * 0x9e3779b9u)));
-
+        
+        // настройка генераторов
         std::uniform_int_distribution<int> stepDist(1, 10);
         std::uniform_int_distribution<int> sleepDist(100, 300);
 
@@ -152,6 +159,7 @@ public:
             // пока арбитр не снимет эксклюзивную блокировку.
             WaitStageStart(stage);
 
+            // начало этапа
             int distance = 0;
 
             while (distance < cfg::kFinishDistance)
@@ -166,6 +174,7 @@ public:
                 if (msgsnd(progressQueueId, &msg, sizeof(msg) - sizeof(long), 0) == -1)
                     DieSys("msgsnd(progress)");
 
+                // имитация движения
                 usleep(static_cast<useconds_t>(sleepDist(rng) * 1000));
             }
 
@@ -178,7 +187,7 @@ public:
                 DieSys("msgsnd(done)");
 
             // ---- Барьер: отмечаемся ----
-            shared->arrivedStage[carId] = stage;
+            shared->arrivedStage[carId] = stage; 
 
             // ---- Ждём, пока арбитр разрешит переход дальше ----
             while (shared->releaseStage < stage)
@@ -225,25 +234,28 @@ public:
         const key_t shmKey = ftok(cfg::kFtokPath, cfg::kProjShm);
         if (shmKey == -1) DieSys("ftok(shmKey)");
 
+        // Создание очереди сообщений
         progressQueueId_ = msgget(msgKey, IPC_CREAT | 0666);
         if (progressQueueId_ == -1) DieSys("msgget");
 
+        // Создание shared memory
         shmId_ = shmget(shmKey, sizeof(SharedState), IPC_CREAT | 0666);
         if (shmId_ == -1) DieSys("shmget");
 
+        // Подключение shared memory
         shared_ = static_cast<SharedState*>(shmat(shmId_, nullptr, 0));
         if (shared_ == reinterpret_cast<void*>(-1)) DieSys("shmat");
 
+        // Инициализация барьера
         *shared_ = SharedState{};
 
-        // До старта: блокируем ВСЕ этапы эксклюзивно.
-        // Машины будут ждать shared lock и стартуют только когда мы unlock.
+        // До старта: блокируем все этапы.
         LockAllStagesExclusive();
     }
 
     ~RaceController()
     {
-        // снять блокировки (на всякий)
+        // снять блокировки 
         UnlockAllStages();
 
         if (shared_ && shared_ != reinterpret_cast<void*>(-1))
@@ -310,6 +322,7 @@ private:
         bool finished{false};
     };
 
+    // Блокировка всех этапов
     void LockAllStagesExclusive()
     {
         stageLockFds_.clear();
@@ -334,7 +347,7 @@ private:
         if (fd < 0) return;
 
         if (flock(fd, LOCK_UN) == -1) DieSys("flock(LOCK_UN) in arbiter");
-        // Можно закрыть, этап больше не понадобится
+        // данный дескриптор этапа больше не нужен
         ::close(fd);
         stageLockFds_[idx] = -1;
     }
@@ -373,7 +386,7 @@ private:
         WriteLine("Подготовка этапа ", stage);
         sleep(1);
 
-        // ---- Старт этапа: снимаем эксклюзивную блокировку с файла этапа ----
+        // снимаем эксклюзивную блокировку с файла этапа
         UnlockStage(stage);
 
         while (!AllCarsFinished())
@@ -385,11 +398,11 @@ private:
 
         DrainProgressQueue();
 
-        // ---- Барьер: ждём arrivedStage ----
+        // Барьер: ждём arrivedStage
         while (!AllCarsArrivedBarrier(stage))
             usleep(cfg::kWaitSleepUs);
 
-        // ---- Разрешаем всем продолжать ----
+        // Разрешаем всем продолжать
         shared_->releaseStage = stage;
     }
 
@@ -413,6 +426,7 @@ private:
             }
         }
 
+        // обнуление ошиьки при пустой очереди
         if (errno == ENOMSG) errno = 0;
     }
 
