@@ -3,22 +3,24 @@
 #include <sys/shm.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
 #include <string>
+#include <vector>
 
 // =============================
-// Константы (чисто и явно)
+// Константы
 // =============================
 namespace cfg
 {
@@ -32,10 +34,12 @@ constexpr char kFtokPath[] = "./ipc_keyfile_lab2";
 constexpr int kProjMsg = 0x42;
 constexpr int kProjShm = 0x43;
 
-// Частота обновления экрана
-constexpr useconds_t kRenderSleepUs = 200'000;
+// Файлы блокировки этапов (3 штуки)
+constexpr char kStageLock1[] = "./stage1.lock";
+constexpr char kStageLock2[] = "./stage2.lock";
+constexpr char kStageLock3[] = "./stage3.lock";
 
-// Пауза ожиданий (старт/барьер)
+constexpr useconds_t kRenderSleepUs = 200'000;
 constexpr useconds_t kWaitSleepUs = 1'000;
 }  // namespace cfg
 
@@ -68,32 +72,52 @@ static void ClearTerminal()
     Write("\033[2J\033[H");
 }
 
+static void EnsureFileExists(const char* path)
+{
+    std::ifstream in(path);
+    if (in.good()) return;
+
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out) DieSys("create file");
+    out << "lock\n";
+}
+
+static int OpenStageLockFile(int stage)
+{
+    const char* path = nullptr;
+    switch (stage)
+    {
+        case 1: path = cfg::kStageLock1; break;
+        case 2: path = cfg::kStageLock2; break;
+        case 3: path = cfg::kStageLock3; break;
+        default: DieSys("bad stage"); break;
+    }
+
+    int fd = ::open(path, O_RDWR | O_CREAT, 0666);
+    if (fd == -1) DieSys("open(stage lock file)");
+    return fd;
+}
+
 // =============================
 // SysV Messages: прогресс машин
 // =============================
 struct ProgressMessage
 {
-    long mtype{1};       // тип для msg queue
+    long mtype{1};
     int carId{};
-    int distance{};      // 0..kFinishDistance
-    int finished{};      // 0/1
+    int distance{};
+    int finished{};
 };
 
 // =============================
-// Shared state: общий сигнал + барьер
+// Shared state: барьер
 // =============================
-// ВАЖНО: это "разделяемый ресурс", доступный всем процессам.
-// Тут и есть "общий сигнал в единственном экземпляре для всех участников". :contentReference[oaicite:5]{index=5}
 struct SharedState
 {
-    // Текущий этап, который разрешено начинать (0..kStageCount)
-    int startStage{0};
-
-    // Текущий этап, который разрешено завершить и перейти дальше (0..kStageCount)
+    // На каком этапе уже разрешили продолжить (0..kStageCount)
     int releaseStage{0};
 
-    // Массив состояния: какой этап уже достиг барьера каждой машиной
-    // (0 = ещё ничего, 1..kStageCount = дошёл до конца этапа N)
+    // Массив состояния: до какого этапа дошла каждая машина (0..kStageCount)
     int arrivedStage[cfg::kCarCount]{};
 };
 
@@ -103,8 +127,17 @@ struct SharedState
 class CarProcess
 {
 public:
-    void Run(int carId, int progressQueueId, SharedState* shared)
+    // inheritedStageLockFds: fd, которые родитель держал залоченными при fork (их надо закрыть в child)
+    void Run(int carId, int progressQueueId, SharedState* shared,
+             const std::vector<int>& inheritedStageLockFds)
     {
+        // Критично: закрываем унаследованные fd лок-файлов,
+        // иначе ребёнок "унаследует" эксклюзивный lock и не будет блокироваться.
+        for (int fd : inheritedStageLockFds)
+        {
+            if (fd >= 0) ::close(fd);
+        }
+
         std::mt19937 rng(static_cast<unsigned>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count()
             ^ (carId * 0x9e3779b9u)));
@@ -114,15 +147,13 @@ public:
 
         for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
-            // ---- Ожидаем общий старт-сигнал (в единственном экземпляре) ----
-            // Арбитр ставит shared->startStage = stage один раз,
-            // а все процессы просто читают эту одну общую переменную. 
-            while (shared->startStage < stage)
-                usleep(cfg::kWaitSleepUs);
+            // ---- Ждём старт этапа через файл-блокировку ----
+            // Арбитр держит LOCK_EX. Мы пытаемся взять LOCK_SH и блокируемся,
+            // пока арбитр не снимет эксклюзивную блокировку.
+            WaitStageStart(stage);
 
             int distance = 0;
 
-            // ---- Едем, периодически отправляя прогресс арбитру через сообщения ----
             while (distance < cfg::kFinishDistance)
             {
                 distance = std::min(cfg::kFinishDistance, distance + stepDist(rng));
@@ -138,7 +169,6 @@ public:
                 usleep(static_cast<useconds_t>(sleepDist(rng) * 1000));
             }
 
-            // ---- Сообщаем "финиш этапа" ----
             ProgressMessage done{};
             done.carId = carId;
             done.distance = cfg::kFinishDistance;
@@ -147,26 +177,47 @@ public:
             if (msgsnd(progressQueueId, &done, sizeof(done) - sizeof(long), 0) == -1)
                 DieSys("msgsnd(done)");
 
-            // ---- Барьер: отмечаемся в массиве состояния ---- 
+            // ---- Барьер: отмечаемся ----
             shared->arrivedStage[carId] = stage;
 
-            // ---- Ждём "разрешение продолжать" от арбитра (общий сигнал) ----
-            // Арбитр выставляет shared->releaseStage = stage, когда все отметились.
+            // ---- Ждём, пока арбитр разрешит переход дальше ----
             while (shared->releaseStage < stage)
                 usleep(cfg::kWaitSleepUs);
         }
     }
+
+private:
+    static void WaitStageStart(int stage)
+    {
+        int fd = OpenStageLockFile(stage);
+
+        // Берём shared lock (блокируется, если арбитр держит exclusive)
+        if (flock(fd, LOCK_SH) == -1)
+            DieSys("flock(LOCK_SH) in car");
+
+        // Сразу отпускаем. Нам нужно только "проскочить" после старта.
+        if (flock(fd, LOCK_UN) == -1)
+            DieSys("flock(LOCK_UN) in car");
+
+        ::close(fd);
+    }
 };
 
 // =============================
-// Судья/арбитр (управляющий процесс)
+// Судья/арбитр
 // =============================
 class RaceController
 {
 public:
     RaceController()
     {
-        EnsureFtokFile();
+        // ftok файл
+        EnsureFileExists(cfg::kFtokPath);
+
+        // stage lock файлы (3 штуки)
+        EnsureFileExists(cfg::kStageLock1);
+        EnsureFileExists(cfg::kStageLock2);
+        EnsureFileExists(cfg::kStageLock3);
 
         const key_t msgKey = ftok(cfg::kFtokPath, cfg::kProjMsg);
         if (msgKey == -1) DieSys("ftok(msgKey)");
@@ -183,13 +234,18 @@ public:
         shared_ = static_cast<SharedState*>(shmat(shmId_, nullptr, 0));
         if (shared_ == reinterpret_cast<void*>(-1)) DieSys("shmat");
 
-        // Инициализация разделяемого состояния
         *shared_ = SharedState{};
+
+        // До старта: блокируем ВСЕ этапы эксклюзивно.
+        // Машины будут ждать shared lock и стартуют только когда мы unlock.
+        LockAllStagesExclusive();
     }
 
     ~RaceController()
     {
-        // Дети уже должны завершиться, теперь чистим ресурсы
+        // снять блокировки (на всякий)
+        UnlockAllStages();
+
         if (shared_ && shared_ != reinterpret_cast<void*>(-1))
             shmdt(shared_);
 
@@ -210,7 +266,7 @@ public:
             if (pid == 0)
             {
                 CarProcess car;
-                car.Run(carId, progressQueueId_, shared_);
+                car.Run(carId, progressQueueId_, shared_, stageLockFds_);
                 std::exit(0);
             }
 
@@ -225,7 +281,6 @@ public:
         for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
             RunStage(stage);
-
             ShowStageStandings(stage);
 
             if (stage == cfg::kStageCount)
@@ -250,17 +305,58 @@ private:
     struct CarView
     {
         int distance{0};
-        int stagePlace{0};     // 1..kCarCount
-        int totalScore{0};     // меньше = лучше
+        int stagePlace{0};
+        int totalScore{0};   // меньше = лучше
         bool finished{false};
     };
+
+    void LockAllStagesExclusive()
+    {
+        stageLockFds_.clear();
+        stageLockFds_.reserve(cfg::kStageCount);
+
+        for (int stage = 1; stage <= cfg::kStageCount; ++stage)
+        {
+            int fd = OpenStageLockFile(stage);
+            if (flock(fd, LOCK_EX) == -1) DieSys("flock(LOCK_EX) in arbiter");
+            stageLockFds_.push_back(fd);
+        }
+    }
+
+    void UnlockStage(int stage)
+    {
+        // stage: 1..3 -> index 0..2
+        int idx = stage - 1;
+        if (idx < 0 || idx >= static_cast<int>(stageLockFds_.size()))
+            DieSys("UnlockStage: bad idx");
+
+        int fd = stageLockFds_[idx];
+        if (fd < 0) return;
+
+        if (flock(fd, LOCK_UN) == -1) DieSys("flock(LOCK_UN) in arbiter");
+        // Можно закрыть, этап больше не понадобится
+        ::close(fd);
+        stageLockFds_[idx] = -1;
+    }
+
+    void UnlockAllStages()
+    {
+        for (int& fd : stageLockFds_)
+        {
+            if (fd >= 0)
+            {
+                flock(fd, LOCK_UN);
+                ::close(fd);
+                fd = -1;
+            }
+        }
+    }
 
     void RunStage(int stage)
     {
         currentStage_ = stage;
         nextFinishPlace_ = 0;
 
-        // Сброс состояния этапа (очки копятся)
         for (auto& car : cars_)
         {
             car.distance = 0;
@@ -268,22 +364,18 @@ private:
             car.finished = false;
         }
 
-        // Сброс барьерного массива для данного этапа (формально необязателен,
-        // но так чище и преподу приятнее)
+        // сброс барьера для этапа
         for (int i = 0; i < cfg::kCarCount; ++i)
             shared_->arrivedStage[i] = 0;
 
-        // "Подготовка"
         ClearTerminal();
         WriteLine("Этап ", stage, "/", cfg::kStageCount, "\n");
         WriteLine("Подготовка этапа ", stage);
         sleep(1);
 
-        // ---- Общий старт-сигнал в одном экземпляре ----
-        // Одно присваивание, общий разделяемый ресурс, доступ всем сразу. 
-        shared_->startStage = stage;
+        // ---- Старт этапа: снимаем эксклюзивную блокировку с файла этапа ----
+        UnlockStage(stage);
 
-        // Основной цикл: читаем сообщения о прогрессе и рисуем
         while (!AllCarsFinished())
         {
             DrainProgressQueue();
@@ -291,14 +383,13 @@ private:
             usleep(cfg::kRenderSleepUs);
         }
 
-        // Добираем хвост сообщений (чтобы не тащились в следующий этап)
         DrainProgressQueue();
 
-        // ---- Барьер: ждём, пока все машины отметятся в массиве arrivedStage ---- 
+        // ---- Барьер: ждём arrivedStage ----
         while (!AllCarsArrivedBarrier(stage))
             usleep(cfg::kWaitSleepUs);
 
-        // ---- Разрешаем всем продолжать (один общий сигнал) ----
+        // ---- Разрешаем всем продолжать ----
         shared_->releaseStage = stage;
     }
 
@@ -318,12 +409,11 @@ private:
             {
                 car.finished = true;
                 car.stagePlace = ++nextFinishPlace_;
-                car.totalScore += car.stagePlace; // меньше = лучше
+                car.totalScore += car.stagePlace;
             }
         }
 
-        if (errno != ENOMSG && errno != 0)
-            errno = 0; // не мешаем жить после ENOMSG
+        if (errno == ENOMSG) errno = 0;
     }
 
     bool AllCarsFinished() const
@@ -380,7 +470,6 @@ private:
             return static_cast<int>(c - &cars_[0]);
         };
 
-        // Стабильно: по месту этапа, при равенстве по номеру машины
         std::sort(order.begin(), order.end(),
                   [&](const CarView* a, const CarView* b)
                   {
@@ -408,7 +497,6 @@ private:
             return static_cast<int>(c - &cars_[0]);
         };
 
-        // Стабильно: меньше очков лучше, при равенстве по номеру машины
         std::sort(ranking.begin(), ranking.end(),
                   [&](const CarView* a, const CarView* b)
                   {
@@ -420,19 +508,9 @@ private:
         {
             const CarView* car = ranking[place];
             const int carNo = IndexOf(car) + 1;
-            WriteLine("Место ", place + 1, ": Машина ", carNo, " (Всего очков: ", car->totalScore, ")");
+            WriteLine("Место ", place + 1, ": Машина ", carNo,
+                      " (Всего очков: ", car->totalScore, ")");
         }
-    }
-
-    static void EnsureFtokFile()
-    {
-        // ftok требует существующий файл
-        std::ifstream in(cfg::kFtokPath);
-        if (in.good()) return;
-
-        std::ofstream out(cfg::kFtokPath, std::ios::out | std::ios::trunc);
-        if (!out) DieSys("create ftok file");
-        out << "lab2\n";
     }
 
 private:
@@ -446,6 +524,9 @@ private:
 
     std::array<pid_t, cfg::kCarCount> carPids_{};
     std::array<CarView, cfg::kCarCount> cars_{};
+
+    // fd файлов блокировки этапов (родитель держит LOCK_EX до старта)
+    std::vector<int> stageLockFds_;
 };
 
 int main()
