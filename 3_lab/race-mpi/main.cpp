@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <string>
+#include <numeric>
 
 #include "mpi.h"
 
@@ -25,14 +26,52 @@ constexpr int number_parts = 3;
 constexpr int track_len = 50;
 constexpr int max_ticks = 600;
 
+static std::string Pad2(int x)
+{
+    if (x < 10) return MakeStr("0", x);
+    return MakeStr(x);
+}
+
+// если захочешь: 123456 ms -> 02:03.456
+static std::string FormatMs(int ms)
+{
+    int m = ms / 60000;
+    int s = (ms / 1000) % 60;
+    int r = ms % 1000;
+    return MakeStr(Pad2(m), ":", Pad2(s), ".", std::string(3 - std::to_string(r).size(), '0'), r, " ms");
+}
+
+// вычисляем места по текущей позиции (больше позиция -> лучше место)
+static std::vector<int> ComputePlaces(const std::vector<int>& pos)
+{
+    int n = (int)pos.size();
+    std::vector<int> idx(n);
+    std::iota(idx.begin(), idx.end(), 0);
+
+    // сортируем только по позиции, root (0) тоже попадет, но мы его не печатаем
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+        return pos[a] > pos[b];
+    });
+
+    std::vector<int> place(n, 0);
+    int cur_place = 1;
+    for (int id : idx)
+        place[id] = cur_place++;
+
+    return place;
+}
+
 static void RenderFrame(int stage, const std::vector<int>& pos)
 {
     std::cout << "\033[2J\033[H";
     std::cout << MakeStr("Этап ", stage, "/", number_parts, "\n\n");
 
+    auto place = ComputePlaces(pos);
+
     for (int r = 1; r < (int)pos.size(); ++r)
     {
         int p = std::clamp(pos[r], 0, track_len);
+        int progress = (int)((long long)p * 100 / track_len);
 
         std::string line;
         line.reserve(track_len + 2);
@@ -40,9 +79,33 @@ static void RenderFrame(int stage, const std::vector<int>& pos)
         line.push_back('>');
         line.append(track_len - p, ' ');
 
-        std::cout << MakeStr("car ", r, " |", line, "|\n");
+        std::cout << MakeStr(
+            "car ", r, " |", line, "| ",
+            progress, " / 100  (place: ", place[r], ")\n"
+        );
     }
     std::cout.flush();
+}
+
+static void PrintStageResults(int stage, const std::vector<int>& finish_times, int size)
+{
+    std::vector<std::pair<int,int>> stage_res;
+    stage_res.reserve(std::max(0, size - 1));
+
+    for (int car = 1; car < size; ++car)
+        stage_res.push_back({car, finish_times[car]});
+
+    std::sort(stage_res.begin(), stage_res.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    std::cout << "\nРезультаты этапа " << stage << ":\n";
+    int place = 1;
+    for (const auto& [car, t] : stage_res)
+    {
+        std::cout << MakeStr("Место ", place++, ": Машина ", car, " (время: ", t, " ms)\n");
+        // если хочешь более “временной” вид:
+        // std::cout << MakeStr("Место ", place++, ": Машина ", car, " (время: ", FormatMs(t), ")\n");
+    }
 }
 
 int main(int argc, char** argv)
@@ -63,7 +126,7 @@ int main(int argc, char** argv)
 
     if (rank == 0)
     {
-        std::map<int, int> total_time;
+        std::map<int, int> total_time; // car -> sum ms
 
         for (auto stage : views::iota(1, number_parts + 1))
         {
@@ -101,13 +164,12 @@ int main(int argc, char** argv)
                        finish_times.data(), 1, MPI_INT,
                        0, MPI_COMM_WORLD);
 
-            std::cout << "\n";
+            // Печать результатов этапа (по местам)
+            PrintStageResults(stage, finish_times, size);
+
+            // Обновляем суммарное время
             for (int car = 1; car < size; ++car)
-            {
-                std::cout << MakeStr("Машина id(", car, ") закончила этап ", stage,
-                                     " за ", finish_times[car], " ms\n");
                 total_time[car] += finish_times[car];
-            }
 
             std::cout << "\n----------------------------------------\n";
             std::cout << "Жми Enter для следующего этапа...\n";
@@ -119,12 +181,15 @@ int main(int argc, char** argv)
         std::sort(result.begin(), result.end(),
                   [](auto& l, auto& r) { return l.second < r.second; });
 
-        std::cout << "\n=== Итоги ===\n";
+        std::cout << "\n=== Итоги гонки ===\n";
         int place = 1;
         for (const auto& [car, time] : result)
         {
-            std::cout << MakeStr("Машина id(", car, ") заняла место ", place++,
-                                 ", суммарно потратила ", time, " ms\n");
+            std::cout << MakeStr("Место ", place++, ": Машина ", car,
+                                 " (общее время: ", time, " ms)\n");
+            // или красивее:
+            // std::cout << MakeStr("Место ", place++, ": Машина ", car,
+            //                      " (общее время: ", FormatMs(time), ")\n");
         }
     }
     else
@@ -146,8 +211,6 @@ int main(int argc, char** argv)
             int stop_flag = 0;
 
             auto started = std::chrono::steady_clock::now();
-
-            // Вот это важно: фиксируем момент финиша, но не выходим из цикла
             int finish_ms = -1;
 
             for (int tick = 0; tick < max_ticks; ++tick)
@@ -171,14 +234,12 @@ int main(int argc, char** argv)
                 std::this_thread::sleep_for(std::chrono::milliseconds(sleep_dist(gen)));
             }
 
-            // Если вдруг кто-то не успел (маловероятно), считаем по факту конца
             if (finish_ms < 0)
             {
                 finish_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - started).count();
             }
 
-            // Отправляем СВОЁ время финиша, а не общее время этапа
             MPI_Gather(&finish_ms, 1, MPI_INT, nullptr, 0, MPI_INT, 0, MPI_COMM_WORLD);
 
             MPI_Barrier(cars);
