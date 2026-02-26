@@ -187,7 +187,7 @@ static inline std::optional<Settings> GetSettings(const std::string& path) {
                     std::cerr << "Ошибка конфига (строка " << line_no << "): requests должен быть > 0\n";
                     return std::nullopt;
                 }
-                settings.requests = v; 
+                settings.requests = v;
                 continue;
             }
 
@@ -308,6 +308,20 @@ static inline void SemOp(int semid, unsigned short semnum, short delta) {
     if (semop(semid, &op, 1) == -1) DieSys("semop");
 }
 
+// НЕБЛОКИРУЮЩАЯ попытка операции над семафором.
+// Возвращает true, если получилось. Если ресурса нет — false (errno == EAGAIN).
+static inline bool SemTryOp(int semid, unsigned short semnum, short delta) {
+    sembuf op{};
+    op.sem_num = semnum;
+    op.sem_op  = delta;
+    op.sem_flg = IPC_NOWAIT;
+    if (semop(semid, &op, 1) == 0) return true;
+
+    if (errno == EAGAIN) return false;
+    DieSys("semop (try)");
+    return false;
+}
+
 static inline unsigned short FuelSemIndex(int gas) {
     switch (gas) {
         case 0: return SEM_FUEL_76;
@@ -412,7 +426,11 @@ static void StationProcess(const Station& st, int semid, ShmHeader* shm) {
 // 5) Производитель (генератор заявок) - выполняется в родителе
 static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm) {
     std::filesystem::create_directory(PROTOCOL_DIR);
+
+    // лог успешных добавлений в очередь
     std::ofstream qlog(std::string(PROTOCOL_DIR) + "/queue.log", std::ios::out | std::ios::app);
+    // лог отказов
+    std::ofstream rlog(std::string(PROTOCOL_DIR) + "/rejects.log", std::ios::out | std::ios::app);
 
     std::mt19937 gen(std::random_device{}());
     std::normal_distribution<double> genDist(settings.create.mean,
@@ -435,8 +453,19 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
         const int gas = pickFuel();
         Car car{ id, gas, NowMs() };
 
-        // Ждём свободное место в очереди 
-        SemOp(semid, SEM_EMPTY, -1);
+        // Пытаемся занять место в очереди. Если мест нет — отклоняем заявку.
+        if (!SemTryOp(semid, SEM_EMPTY, -1)) {
+            std::cout << "ОТКАЗ: машина #" << car.id << " (" << ToString(static_cast<GasType>(gas))
+                      << ") — очередь заполнена\n";
+
+            rlog << "ОТКАЗ: машина=" << car.id
+                 << " топливо=" << ToString(static_cast<GasType>(car.gas))
+                 << " ts_ms=" << car.ts_ms
+                 << " причина=очередь_заполнена"
+                 << "\n";
+            rlog.flush();
+            continue;
+        }
 
         // Критическая секция: добавляем в shared memory очередь
         SemOp(semid, SEM_MUTEX, -1);
@@ -479,7 +508,7 @@ static void ProducerProcess(const Settings& settings, int semid, ShmHeader* shm)
     qlog.flush();
 }
 
-static constexpr const char* FTOK_PATH    = "ipc_keyfile_gaslab";
+static constexpr const char* FTOK_PATH = "ipc_keyfile_gaslab";
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -493,7 +522,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     Settings settings = *settingsOpt;
-
 
     std::filesystem::remove_all(PROTOCOL_DIR);
     std::filesystem::create_directory(PROTOCOL_DIR);
