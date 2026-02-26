@@ -1,1 +1,0 @@
-add_executable(racing_competition main.cpp)

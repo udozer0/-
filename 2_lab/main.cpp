@@ -154,7 +154,7 @@ public:
 
         for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
-            // ---- Ждём старт этапа через файл-блокировку ----
+            // Ждём старт этапа через файл-блокировку 
             // Арбитр держит LOCK_EX. Мы пытаемся взять LOCK_SH и блокируемся,
             // пока арбитр не снимет эксклюзивную блокировку.
             WaitStageStart(stage);
@@ -186,10 +186,10 @@ public:
             if (msgsnd(progressQueueId, &done, sizeof(done) - sizeof(long), 0) == -1)
                 DieSys("msgsnd(done)");
 
-            // ---- Барьер: отмечаемся ----
+            // Барьер: отмечаемся 
             shared->arrivedStage[carId] = stage; 
 
-            // ---- Ждём, пока арбитр разрешит переход дальше ----
+            // Ждём, пока арбитр разрешит переход дальше
             while (shared->releaseStage < stage)
                 usleep(cfg::kWaitSleepUs);
         }
@@ -212,9 +212,7 @@ private:
     }
 };
 
-// =============================
-// Судья/арбитр
-// =============================
+// арбитр
 class RaceController
 {
 public:
@@ -318,7 +316,7 @@ private:
     {
         int distance{0};
         int stagePlace{0};
-        int totalScore{0};   // меньше = лучше
+        int totalScore{0};   
         bool finished{false};
     };
 
