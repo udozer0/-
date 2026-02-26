@@ -291,6 +291,11 @@ public:
         for (int stage = 1; stage <= cfg::kStageCount; ++stage)
         {
             RunStage(stage);
+
+            // Копим результаты этапа для финальной сводки
+            CaptureStageResults(stage);
+
+            // Оставляем вывод промежуточных результатов сразу после этапа
             ShowStageStandings(stage);
 
             if (stage == cfg::kStageCount)
@@ -305,6 +310,8 @@ public:
             }
         }
 
+        // В конце выводим сводку по всем этапам + финальные результаты
+        ShowAllStageStandings();
         ShowFinalStandings();
 
         for (pid_t pid : carPids_)
@@ -318,6 +325,18 @@ private:
         int stagePlace{0};
         int totalScore{0};   
         bool finished{false};
+    };
+
+    /// Снимок результатов этапа, чтобы вывести в конце вместе с финалом
+    struct StageSnapshot
+    {
+        /// placeToCarNo[place] = номер машины (1..kCarCount) на данном месте
+        std::array<int, cfg::kCarCount> placeToCarNo{};
+        /// carPlace[carIdx] = место (1..kCarCount) данной машины на этапе
+        std::array<int, cfg::kCarCount> carPlace{};
+        /// totalScoreAfterStage[carIdx] = сумма очков у машины после этапа
+        std::array<int, cfg::kCarCount> totalScoreAfterStage{};
+        bool valid{false};
     };
 
     // Блокировка всех этапов
@@ -470,6 +489,45 @@ private:
         }
     }
 
+    /// Сохраняем результаты этапа в stageResults_ для финальной сводки
+    void CaptureStageResults(int stage)
+    {
+        const int idx = stage - 1;
+        if (idx < 0 || idx >= cfg::kStageCount) DieSys("CaptureStageResults: bad stage");
+
+        std::array<const CarView*, cfg::kCarCount> order{};
+        for (int i = 0; i < cfg::kCarCount; ++i)
+            order[i] = &cars_[i];
+
+        auto IndexOf = [&](const CarView* c) -> int {
+            return static_cast<int>(c - &cars_[0]);
+        };
+
+        std::sort(order.begin(), order.end(),
+                  [&](const CarView* a, const CarView* b)
+                  {
+                      if (a->stagePlace != b->stagePlace) return a->stagePlace < b->stagePlace;
+                      return IndexOf(a) < IndexOf(b);
+                  });
+
+        StageSnapshot snap{};
+        for (int place = 0; place < cfg::kCarCount; ++place)
+        {
+            const CarView* car = order[place];
+            const int carIdx = IndexOf(car);
+            const int carNo = carIdx + 1;
+
+            snap.placeToCarNo[place] = carNo;
+            snap.carPlace[carIdx] = place + 1;
+        }
+
+        for (int i = 0; i < cfg::kCarCount; ++i)
+            snap.totalScoreAfterStage[i] = cars_[i].totalScore;
+
+        snap.valid = true;
+        stageResults_[idx] = snap;
+    }
+
     void ShowStageStandings(int stage) const
     {
         WriteLine("\nРезультаты этапа ", stage, ":");
@@ -494,6 +552,34 @@ private:
             const CarView* car = order[place];
             const int carNo = IndexOf(car) + 1;
             WriteLine("Место ", place + 1, ": Машина ", carNo, " (Очки: ", car->totalScore, ")");
+        }
+    }
+
+    /// Выводим накопленные результаты всех этапов в конце
+    void ShowAllStageStandings() const
+    {
+        WriteLine("\n=== Результаты этапов (сводка) ===");
+
+        for (int stage = 1; stage <= cfg::kStageCount; ++stage)
+        {
+            const int idx = stage - 1;
+            const StageSnapshot& snap = stageResults_[idx];
+
+            WriteLine("\nРезультаты этапа ", stage, ":");
+
+            if (!snap.valid)
+            {
+                WriteLine("(нет данных, что-то пошло не так)");
+                continue;
+            }
+
+            for (int place = 0; place < cfg::kCarCount; ++place)
+            {
+                const int carNo = snap.placeToCarNo[place];
+                const int carIdx = carNo - 1;
+                WriteLine("Место ", place + 1, ": Машина ", carNo,
+                          " (Очки после этапа: ", snap.totalScoreAfterStage[carIdx], ")");
+            }
         }
     }
 
@@ -539,6 +625,9 @@ private:
 
     // fd файлов блокировки этапов (родитель держит LOCK_EX до старта)
     std::vector<int> stageLockFds_;
+
+    // накопленные результаты этапов
+    std::array<StageSnapshot, cfg::kStageCount> stageResults_{};
 };
 
 int main()
