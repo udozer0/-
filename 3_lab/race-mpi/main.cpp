@@ -87,7 +87,8 @@ static void RenderFrame(int stage, const std::vector<int>& pos)
     std::cout.flush();
 }
 
-static void PrintStageResults(int stage, const std::vector<int>& finish_times, int size)
+// Возвращает отсортированный по времени список (car, time_ms)
+static std::vector<std::pair<int,int>> BuildStageResults(const std::vector<int>& finish_times, int size)
 {
     std::vector<std::pair<int,int>> stage_res;
     stage_res.reserve(std::max(0, size - 1));
@@ -98,6 +99,11 @@ static void PrintStageResults(int stage, const std::vector<int>& finish_times, i
     std::sort(stage_res.begin(), stage_res.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
+    return stage_res;
+}
+
+static void PrintStageResults(int stage, const std::vector<std::pair<int,int>>& stage_res)
+{
     std::cout << "\nРезультаты этапа " << stage << ":\n";
     int place = 1;
     for (const auto& [car, t] : stage_res)
@@ -105,6 +111,20 @@ static void PrintStageResults(int stage, const std::vector<int>& finish_times, i
         std::cout << MakeStr("Место ", place++, ": Машина ", car, " (время: ", t, " ms)\n");
         // если хочешь более “временной” вид:
         // std::cout << MakeStr("Место ", place++, ": Машина ", car, " (время: ", FormatMs(t), ")\n");
+    }
+}
+
+static void PrintAllStagesSummary(const std::vector<std::vector<std::pair<int,int>>>& all_stages)
+{
+    std::cout << "\n=== Результаты этапов (сводка) ===\n";
+    for (int stage = 1; stage <= (int)all_stages.size(); ++stage)
+    {
+        std::cout << "\nРезультаты этапа " << stage << ":\n";
+        int place = 1;
+        for (const auto& [car, t] : all_stages[stage - 1])
+        {
+            std::cout << MakeStr("Место ", place++, ": Машина ", car, " (время: ", t, " ms)\n");
+        }
     }
 }
 
@@ -127,6 +147,10 @@ int main(int argc, char** argv)
     if (rank == 0)
     {
         std::map<int, int> total_time; // car -> sum ms
+
+        // НОВОЕ: копим результаты каждого этапа, чтобы вывести в конце
+        std::vector<std::vector<std::pair<int,int>>> all_stage_results;
+        all_stage_results.reserve(number_parts);
 
         for (auto stage : views::iota(1, number_parts + 1))
         {
@@ -164,8 +188,14 @@ int main(int argc, char** argv)
                        finish_times.data(), 1, MPI_INT,
                        0, MPI_COMM_WORLD);
 
-            // Печать результатов этапа (по местам)
-            PrintStageResults(stage, finish_times, size);
+            // Строим результаты этапа (отсортированные)
+            auto stage_res = BuildStageResults(finish_times, size);
+
+            // Оставляем вывод результатов этапа сразу после этапа
+            PrintStageResults(stage, stage_res);
+
+            // НОВОЕ: сохраняем результаты этапа для вывода в конце
+            all_stage_results.push_back(stage_res);
 
             // Обновляем суммарное время
             for (int car = 1; car < size; ++car)
@@ -176,6 +206,9 @@ int main(int argc, char** argv)
             std::cout.flush();
             std::cin.get();
         }
+
+        // НОВОЕ: печатаем сводку по этапам в конце (для сравнения)
+        PrintAllStagesSummary(all_stage_results);
 
         std::vector<std::pair<int, int>> result(total_time.begin(), total_time.end());
         std::sort(result.begin(), result.end(),

@@ -187,6 +187,7 @@ public:
                 DieSys("msgsnd(done)");
 
             // Барьер: отмечаемся 
+            // МАШИНКА
             shared->arrivedStage[carId] = stage; 
 
             // Ждём, пока арбитр разрешит переход дальше
@@ -416,6 +417,7 @@ private:
         DrainProgressQueue();
 
         // Барьер: ждём arrivedStage
+        // АРБИТР
         while (!AllCarsArrivedBarrier(stage))
             usleep(cfg::kWaitSleepUs);
 
